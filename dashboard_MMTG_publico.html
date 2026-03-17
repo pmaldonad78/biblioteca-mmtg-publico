@@ -189,7 +189,7 @@ code{background:rgba(255,255,255,.1);padding:1px 5px;border-radius:3px;font-size
 </div>
 </div>
 </header>
-
+<div id="yearPill" style="display:none"></div>
 
 <!-- TABS -->
 <div class="tabs" id="tabBar"></div>
@@ -299,53 +299,33 @@ function openEditSection(sectionKey) { /* view-only mode */ }
 let DB = {};         // all years data
 let CY = '2024-25'; // current year
 let CF = 'all';     // current filter (all|s1|s2)
-let CHARTS = {};     // Chart.js instances keyed by id
-let SHEET_ID = '';   // Google Sheets ID
-let SOURCE = 'local'; // 'local' | 'sheets'
-let MODAL_KEY = '';  // which section is being edited
+let CHARTS = {};    // Chart.js instances keyed by id
+let SOURCE = 'local';
 
-const LS_KEY = 'mmtg_v4_db';
-const LS_CFG = 'mmtg_v4_cfg';
+const LS_KEY  = 'mmtg_v4_db';
+const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyWQDInGddb1kCxLiceusJCAr4AAHLauDtOHaSCQGohHUSJQXbJSEruphIa8as8HcL8Ig/exec';
 
 // ═══════════════════════════════════════════════════════════
 //  BOOT
 // ═══════════════════════════════════════════════════════════
 async function boot() {
-  setLoad('Cargando configuración...', 10);
-  
-  // Load saved config
-  try {
-    const cfg = JSON.parse(localStorage.getItem(LS_CFG) || '{}');
-    SHEET_ID = cfg.sheetId || '';
-  } catch(e) {}
-
-  // Load local DB (seed + any saved changes)
-  try {
-    const saved = JSON.parse(localStorage.getItem(LS_KEY) || '{}');
-    DB = Object.assign({}, SEED, saved);
-  } catch(e) { DB = Object.assign({}, SEED); }
+  setLoad('Cargando datos base...', 10);
+  DB = Object.assign({}, SEED);
 
   setLoad('Construyendo interfaz...', 40);
   buildTabs();
   buildPanels();
-  
-  setLoad('Conectando fuente de datos...', 65);
-  
-  if (SHEET_ID) {
-    setLoad('Sincronizando con Google Sheets...', 75);
-    // view-only: no sync
-  } else {
-    setConnStatus('local');
-    setLoad('Cargando datos locales...', 90);
+
+  setLoad('Sincronizando con Google Sheets...', 65);
+  try {
+    await syncFromSheets(true);
+  } catch(e) {
+    console.warn('Sync failed, using seed data:', e);
   }
 
   setLoad('Listo', 100);
   renderAll();
-  
   setTimeout(() => document.getElementById('LS').classList.add('hidden'), 600);
-  if (!SHEET_ID) {
-    setTimeout(() => showToast('Sin Google Sheets configurado — usando datos locales. Haz clic en "Configurar".','warn',5000), 800);
-  }
 }
 
 function setLoad(msg, pct) {
@@ -354,33 +334,64 @@ function setLoad(msg, pct) {
 }
 
 // ═══════════════════════════════════════════════════════════
-//  GOOGLE SHEETS INTEGRATION
+//  APPS SCRIPT INTEGRATION (read-only)
 // ═══════════════════════════════════════════════════════════
-function sheetUrl(year) {
-  return `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:json&sheet=${encodeURIComponent(year)}`;
+async function fetchScriptYear(year) {
+  const url = `${SCRIPT_URL}?sheet=${encodeURIComponent(year)}`;
+  console.log('[PUB] Fetching:', year);
+  const res = await fetch(url, {redirect: 'follow'});
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const json = await res.json();
+  if (json.error) throw new Error(json.error);
+  const out = {};
+  Object.entries(json).forEach(([k, v]) => {
+    if (!FIELD_LABELS[k]) return;
+    out[k] = Array.isArray(v) ? v.map(n => Number(n)||0) : Array(12).fill(0);
+  });
+  console.log('[PUB]', year, '→', Object.keys(out).length, 'campos');
+  return out;
 }
 
-async function fetchSheetYear(year) { /* view-only mode */ }
-
-async function syncFromSheets(silent = false) { /* view-only mode */ }
-
-async function syncNow() { /* view-only mode */ }
-
-function setConnStatus(s) {
-  const dot = document.getElementById('connDot');
-  const lbl = document.getElementById('connLabel');
-  dot.className = 'conn-dot ' + s;
-  lbl.textContent = s === 'live' ? 'Google Sheets' : s === 'local' ? 'Modo local' : 'Error conexión';
+async function syncFromSheets(silent = false) {
+  const candidates = new Set(Object.keys(DB));
+  const now = new Date().getFullYear();
+  for (let y = now - 1; y <= now + 1; y++) {
+    candidates.add(`${y}-${String((y+1)%100).padStart(2,'0')}`);
+  }
+  const found = [];
+  for (const yr of candidates) {
+    try {
+      const data = await fetchScriptYear(yr);
+      // Only include years with at least one non-zero value
+      const hasData = Object.values(data).some(arr => arr.some(v => v > 0));
+      if (hasData) found.push({yr, data});
+      else console.log('[PUB] Skipping', yr, '— all zeros');
+    } catch(e) {
+      console.warn('[PUB] Error fetching', yr, ':', e.message);
+    }
+  }
+  console.log('[PUB] Found years:', found.map(f=>f.yr));
+  if (found.length > 0) {
+    found.forEach(({yr, data}) => {
+      if (!DB[yr]) DB[yr] = blankYear();
+      DB[yr] = Object.assign({}, DB[yr], data);
+    });
+    SOURCE = 'sheets';
+    const years = found.map(f=>f.yr).sort();
+    // Default to most recent year with data
+    CY = years[years.length - 1];
+    const lastSyncEl = document.getElementById('lastSync');
+    if (lastSyncEl) lastSyncEl.textContent = '🔒 Vista pública · ' + years.join(', ');
+    buildYearPill();
+    renderAll();
+  }
 }
 
-// ═══════════════════════════════════════════════════════════
-//  SETUP
-// ═══════════════════════════════════════════════════════════
-function toggleSetup() { /* view-only mode */ }
-
-function saveSheetConfig() { /* view-only mode */ }
-
-async function testConnection() { /* view-only mode */ }
+function setConnStatus(s) { /* view-only */ }
+function toggleSetup()    { /* view-only */ }
+function saveSheetConfig(){ /* view-only */ }
+async function testConnection() { /* view-only */ }
+async function syncNow()  { await syncFromSheets(false); }
 
 function useLocalMode() { /* view-only mode */ }
 
